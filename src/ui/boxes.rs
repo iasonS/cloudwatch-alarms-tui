@@ -1,0 +1,392 @@
+//! Box frame: rounded borders, titles fitted on the top border, a text and the key hints on the
+//! bottom border, a scrollbar over the right border.
+//!
+//! From macmon (MIT, see LICENSE-macmon).
+
+use std::ops::Range;
+
+use ratatui::Frame;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Scrollbar, ScrollbarOrientation, ScrollbarState};
+
+use super::theme::{self, dim, faint};
+
+/// Between the key hints on a bottom border.
+const SEPARATOR: &str = " | ";
+/// Fewest cells worth a text on the left of a bottom border; with less room it is left out.
+const BORDER_TEXT_MIN: u16 = 8;
+/// End of a cut text.
+pub(super) const ELLIPSIS: &str = "…";
+
+/// `width` cells as `u16`, the type of screen coordinates; saturating, as no text on screen is
+/// wider than the screen.
+pub(super) fn cells(width: usize) -> u16 {
+  u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+fn width_u16(line: &Line) -> u16 {
+  cells(line.width())
+}
+
+fn spans_width(spans: &[Span]) -> u16 {
+  cells(spans.iter().map(Span::width).sum())
+}
+
+/// The longest start of `text` (whole characters) at most `max` cells wide.
+pub(super) fn head(text: &str, max: usize) -> &str {
+  let mut end = 0;
+  for (i, c) in text.char_indices() {
+    let next = i + c.len_utf8();
+    if Span::raw(&text[..next]).width() > max {
+      break;
+    }
+    end = next;
+  }
+  &text[..end]
+}
+
+// MARK: Titles
+
+/// Titles on the top border of a box: left titles and an optional right one. When the border is
+/// too short, the first left title is truncated, while later left titles and then the right
+/// title are dropped, so titles never overlap.
+#[derive(Default)]
+pub(super) struct Titles<'a> {
+  left: Vec<Line<'a>>,
+  right: Option<Line<'a>>,
+}
+
+impl<'a> Titles<'a> {
+  pub(super) fn new(title: impl Into<Line<'a>>) -> Self {
+    Self { left: vec![title.into()], ..Default::default() }
+  }
+
+  pub(super) fn right(mut self, title: impl Into<Line<'a>>) -> Self {
+    self.right = Some(title.into());
+    self
+  }
+
+  /// Draws the titles over the top border of `area`; unstyled text gets `style`.
+  fn render(self, area: Rect, buf: &mut Buffer, style: Style) {
+    let pad = |line: Line<'a>| {
+      let mut spans = vec![Span::raw(" ")];
+      spans.extend(line.spans);
+      spans.push(Span::raw(" "));
+      Line::from(spans).style(style.patch(line.style))
+    };
+
+    let left: Vec<Line> = self.left.into_iter().map(pad).collect();
+    let right = self.right.map(pad);
+
+    let widths: Vec<u16> = left.iter().map(width_u16).collect();
+    let slots = place_titles(area.width, &widths, right.as_ref().map(width_u16));
+    for (line, (x, width)) in left.iter().zip(slots.left) {
+      buf.set_line(area.x + x, area.y, line, width);
+    }
+
+    if let (Some(line), Some(x)) = (right, slots.right) {
+      buf.set_line(area.x + x, area.y, &line, width_u16(&line));
+    }
+  }
+}
+
+/// Positions of titles on a border `width` cells wide, as offsets from the box's left edge.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TitleSlots {
+  /// `(x, visible width)` of the left titles that fit.
+  left: Vec<(u16, u16)>,
+  right: Option<u16>,
+}
+
+/// Fits titles of the given widths on a border `width` cells wide. Titles keep at least one border
+/// cell between each other and next to the corners. The first left title is truncated to fit; the
+/// other titles are placed in full or dropped: left ones first, then the right one.
+fn place_titles(width: u16, left: &[u16], right: Option<u16>) -> TitleSlots {
+  let (left, free) = place_left(width, left);
+  let right = right.filter(|&title| title > 0 && free.start.saturating_add(title) <= free.end);
+  TitleSlots { left, right: right.map(|title| free.end - title) }
+}
+
+/// The left titles of `place_titles`: their `(x, visible width)` and the cells still free after
+/// them, `[start, end)`.
+fn place_left(width: u16, left: &[u16]) -> (Vec<(u16, u16)>, Range<u16>) {
+  let mut slots = vec![];
+  let mut free = 2..width.saturating_sub(2);
+  for (i, &title) in left.iter().enumerate() {
+    let room = free.end.saturating_sub(free.start);
+    if room == 0 || (i > 0 && title > room) {
+      break;
+    }
+
+    let title = title.min(room);
+    slots.push((free.start, title));
+    free.start = free.start.saturating_add(title).saturating_add(1);
+  }
+  (slots, free)
+}
+
+/// Draws a rounded box with `titles` on the top border. Returns the area inside the borders.
+pub(super) fn draw_box(f: &mut Frame, area: Rect, titles: Titles) -> Rect {
+  let block = Block::bordered().border_type(BorderType::Rounded).border_style(theme::BORDER);
+  let inner = block.inner(area);
+  f.render_widget(block, area);
+  // title text without a color of its own in the text color, not the border's
+  titles.render(area, f.buffer_mut(), Style::new().fg(theme::TEXT));
+  inner
+}
+
+/// Draws a scrollbar over the right border of box `area` beside `rows`, the cells of a list of
+/// `len` rows scrolled to `offset`, when they don't fit: `↑` and `↓` at the ends, the thumb
+/// between them on the border line. Fewer than 3 rows leave no room for it.
+pub(super) fn draw_scrollbar(f: &mut Frame, area: Rect, rows: Rect, len: usize, offset: usize) {
+  let page = usize::from(rows.height);
+  if len <= page || page < 3 || area.width < 2 {
+    return;
+  }
+  let bar = Rect { x: area.right() - 1, width: 1, ..rows };
+  // scroll positions, not rows, so the thumb reaches the bottom at the last one
+  let mut state =
+    ScrollbarState::new(len - page + 1).position(offset).viewport_content_length(page);
+  let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+    .begin_symbol(Some("↑"))
+    .end_symbol(Some("↓"))
+    .track_symbol(None)
+    .thumb_symbol("┃")
+    .style(theme::BORDER)
+    .thumb_style(theme::TEXT);
+  f.render_stateful_widget(scrollbar, bar, &mut state);
+}
+
+// MARK: Bottom border
+
+/// A key hint: the key in `theme::key`, what it does `theme::faint` around it. A letter key in the
+/// label stays in it (the first match: `quit`), any other key comes before it (`↑↓ move`, `Enter
+/// details`); with an empty label only the key shows.
+pub(super) fn hint(key: &'static str, label: impl Into<String>) -> Vec<Span<'static>> {
+  let label = label.into();
+  let letter = key.as_bytes().first().filter(|c| key.len() == 1 && c.is_ascii_alphabetic());
+  if let Some(i) = letter.and_then(|c| label.bytes().position(|b| b.eq_ignore_ascii_case(c))) {
+    let (head, tail) = (label[..i].to_string(), label[i + 1..].to_string());
+    return vec![faint(head), theme::key(label[i..=i].to_string()), faint(tail)];
+  }
+  if label.is_empty() {
+    return vec![theme::key(key)];
+  }
+  vec![theme::key(key), faint(format!(" {label}"))]
+}
+
+/// `items` joined by a dim ` | `.
+fn join(items: impl IntoIterator<Item = Vec<Span<'static>>>) -> Vec<Span<'static>> {
+  let mut spans = vec![];
+  for (i, item) in items.into_iter().enumerate() {
+    if i > 0 {
+      spans.push(dim(SEPARATOR));
+    }
+    spans.extend(item);
+  }
+  spans
+}
+
+/// `spans` with a blank cell at both ends.
+fn padded(spans: Vec<Span<'static>>) -> Line<'static> {
+  let mut line = vec![Span::raw(" ")];
+  line.extend(spans);
+  line.push(Span::raw(" "));
+  Line::from(line)
+}
+
+/// Number of leading `items` (by width) that fit in `room` cells joined by ` | `, with a blank
+/// cell at both ends.
+fn fit_joined(room: u16, items: &[u16]) -> usize {
+  // the blank cells at both ends, then each item after its separator
+  let mut used = 2;
+  for (i, &item) in items.iter().enumerate() {
+    let gap = if i == 0 { 0 } else { SEPARATOR.len() as u32 };
+    used += gap + u32::from(item);
+    if used > u32::from(room) {
+      return i;
+    }
+  }
+
+  items.len()
+}
+
+/// `spans` cut to `max` cells, ending with a dim `…` when cut (right after the last word kept).
+fn cut_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+  if spans.iter().map(Span::width).sum::<usize>() <= max {
+    return spans;
+  }
+
+  let mut room = max.saturating_sub(1);
+  let mut cut = vec![];
+  for span in spans {
+    let kept = head(&span.content, room);
+    if kept.len() < span.content.len() {
+      cut.push(Span::styled(kept.trim_end().to_string(), span.style));
+      break;
+    }
+    room -= Span::raw(kept).width();
+    cut.push(span);
+  }
+  cut.push(dim(ELLIPSIS));
+  cut
+}
+
+/// Draws `hints` (right-aligned) and a text (left) over the bottom border of box `area`. Like
+/// titles, they keep a border cell next to the corners and between each other. The hints come
+/// first and drop from the end when the border is too short, so the first one stays as long as it
+/// fits. The text gets the cells left: `text` makes it for that many cells (without its blank
+/// cells), and it is cut with `…` when longer, or left out with fewer than `BORDER_TEXT_MIN`.
+pub(super) fn render_bottom_border(
+  f: &mut Frame,
+  area: Rect,
+  hints: Vec<Vec<Span<'static>>>,
+  text: impl FnOnce(usize) -> Vec<Span<'static>>,
+) {
+  let y = area.bottom() - 1;
+  let mut free = area.width.saturating_sub(4);
+
+  let widths: Vec<u16> = hints.iter().map(|hint| spans_width(hint)).collect();
+  let shown = fit_joined(free, &widths);
+  if shown > 0 {
+    let line = padded(join(hints.into_iter().take(shown)));
+    let width = width_u16(&line);
+    f.buffer_mut().set_line(area.right() - 2 - width, y, &line, width);
+    free = free.saturating_sub(width + 1);
+  }
+
+  let room = free.saturating_sub(2);
+  if room >= BORDER_TEXT_MIN {
+    let spans = cut_spans(text(usize::from(room)), usize::from(room));
+    if !spans.is_empty() {
+      f.buffer_mut().set_line(area.x + 2, y, &padded(spans), room + 2);
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use ratatui::Terminal;
+  use ratatui::backend::TestBackend;
+  use ratatui::buffer::Buffer;
+  use ratatui::layout::Rect;
+  use ratatui::style::{Modifier, Style};
+  use ratatui::text::Span;
+
+  use super::{Titles, draw_box, draw_scrollbar, head, hint, place_titles, render_bottom_border};
+  use crate::ui::theme::{self, dim, text};
+
+  #[test]
+  fn a_scrollbar_needs_3_rows() {
+    // 100 rows, 1 to 3 of them on screen: the plain border, then `↑`, a thumb and `↓`
+    for height in 1..=3 {
+      let mut term = Terminal::new(TestBackend::new(10, height + 2)).unwrap();
+      let frame = term.draw(|f| {
+        draw_box(f, f.area(), Titles::default());
+        draw_scrollbar(f, f.area(), Rect::new(1, 1, 8, height), 100, 0);
+      });
+      let buf = frame.unwrap().buffer;
+      let border: String = (1..=height).map(|y| buf[(9, y)].symbol()).collect();
+      let shown = if height < 3 { "│".repeat(height.into()) } else { "↑┃↓".into() };
+      assert_eq!(border, shown, "{height} rows");
+    }
+  }
+
+  /// Top border of a box `width` cells wide with `titles` drawn on it.
+  fn border_with(titles: Titles, width: u16) -> String {
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+    buf.set_string(0, 0, "─".repeat(width.into()), Style::new());
+    titles.render(buf.area, &mut buf, Style::new());
+    (0..width).map(|x| buf[(x, 0)].symbol()).collect()
+  }
+
+  #[test]
+  fn the_right_title_goes_before_the_left_one_is_cut() {
+    let titles = || Titles::new("Timescale").right("11 ok");
+    assert_eq!(border_with(titles(), 24), "── Timescale ── 11 ok ──");
+    assert_eq!(border_with(titles(), 23), "── Timescale ─ 11 ok ──");
+    assert_eq!(border_with(titles(), 22), format!("── Timescale {}", "─".repeat(9)));
+    assert_eq!(border_with(titles(), 10), "── Times──");
+  }
+
+  #[test]
+  fn titles_never_overlap() {
+    let sizes = [0, 1, 3, 6, 9, 14, 20, 33];
+    for width in 0..=120 {
+      for (a, b) in sizes.iter().flat_map(|a| sizes.map(|b| (*a, b))) {
+        for right in [None, Some(a), Some(b)] {
+          let slots = place_titles(width, &[a, b], right);
+          let mut spans: Vec<(u16, u16)> = slots.left.clone();
+          spans.extend(slots.right.zip(right));
+
+          let ctx = format!("width {width} left [{a}, {b}] right {right:?}");
+          for (i, &(x, w)) in spans.iter().enumerate() {
+            assert!(x >= 2 && x + w + 2 <= width, "{ctx}: ({x}, {w}) off the border");
+            for &(x2, w2) in &spans[i + 1..] {
+              assert!(x + w < x2 || x2 + w2 < x, "{ctx}: ({x}, {w}) touches ({x2}, {w2})");
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /// `spans` as text with the keys (`theme::KEY`, no modifier) in brackets and the faint text
+  /// (default color, `Modifier::DIM`) plain; any other style panics.
+  fn marked(spans: &[Span]) -> String {
+    let mark = |span: &Span| match (span.style.fg, span.style.add_modifier) {
+      (Some(theme::KEY), modifier) if modifier.is_empty() => format!("[{}]", span.content),
+      (Some(theme::TEXT), Modifier::DIM) => span.content.to_string(),
+      style => panic!("{:?} in {style:?}", span.content),
+    };
+    spans.iter().map(mark).collect()
+  }
+
+  #[test]
+  fn hint_marks_the_key_in_the_label_or_before_it() {
+    let hints = [
+      (hint("q", "quit"), "[q]uit"),
+      (hint("r", "refresh"), "[r]efresh"),
+      (hint("w", "3h"), "[w] 3h"),
+      (hint("Enter", "details"), "[Enter] details"),
+      (hint("↑↓", "move"), "[↑↓] move"),
+      (hint("?", ""), "[?]"),
+    ];
+    for (spans, text) in hints {
+      assert_eq!(marked(&spans), text);
+    }
+  }
+
+  #[test]
+  fn bottom_border_hints_come_first_then_the_text() {
+    let draw = |width| {
+      let hints = vec![hint("r", "refresh"), hint("q", "quit")];
+      let updated = |_: usize| vec![text("updated 18:05:12"), dim(" · 57 alarms")];
+      let mut term = Terminal::new(TestBackend::new(width, 1)).unwrap();
+      term.draw(|f| render_bottom_border(f, f.area(), hints, updated)).unwrap().buffer.clone()
+    };
+    let border = |width| {
+      let buf = draw(width);
+      (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>().replace(' ', "_")
+    };
+    let keys = "_refresh_|_quit_";
+
+    assert_eq!(border(60), format!("___updated_18:05:12_·_57_alarms_{}{keys}__", "_".repeat(10)));
+    // the text is cut with `…` in the room the hints leave, and left out with fewer than 8 cells
+    assert_eq!(border(40), format!("___updated_18:05:12…__{keys}__"));
+    assert_eq!(border(31), format!("___updated…__{keys}__"));
+    assert_eq!(border(30), format!("{}{keys}__", "_".repeat(12)));
+    // hints drop from the end, the first one stays as long as it fits
+    assert_eq!(border(13), "___refresh___");
+  }
+
+  #[test]
+  fn head_keeps_whole_characters() {
+    assert_eq!(head("kafka-lag", 5), "kafka");
+    assert_eq!(head("≥90", 2), "≥9");
+    assert_eq!(head("abc", 9), "abc");
+  }
+}
